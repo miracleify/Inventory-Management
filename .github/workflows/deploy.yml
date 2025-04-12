@@ -1,0 +1,133 @@
+name: Deployment to EC2 server
+
+on:
+  push:
+    branches:
+      - develop  # Ensures deployment from the develop branch
+      - master   # Ensures deployment from the master branch
+
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code  # Fetch the latest code from the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # Fetch only the latest commit
+
+      - name: Configure AWS credentials  # AWS CLI Configuration
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}  # Must match GitHub Secrets
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}  # Must match GitHub Secrets
+          aws-region: ${{ secrets.AWS_REGION }}  # Must match GitHub Secrets
+
+      - name: Login to Amazon ECR  # AWS Elastic Container Registry (ECR) Authentication
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image  # Build and push the Docker image to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true  # Push the built image to AWS ECR
+          tags: ${{ secrets.AWS_ECR_REGISTRY }}/${{ secrets.AWS_ECR_REPOSITORY }}:${{ github.sha }}
+                
+  deploy_to_staging: #This is where you connect either private or public-ec2 servers 
+    needs: [build]  # Ensures this job runs only after the build job is complete
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to EC2 via Bastion (Private EC2)
+        uses: appleboy/ssh-action@master
+        if: github.ref == 'refs/heads/develop'  # Ensures deployment only from the develop branch
+        with:
+          host: ${{ secrets.BASTION_HOST }}  # Must match GitHub Secrets
+          username: ${{ secrets.BASTION_USER }}  # Must match GitHub Secrets
+          key: ${{ secrets.BASTION_SSH_KEY }}  # Must match GitHub Secrets
+          script: |
+            set -ex
+            export IMAGE_TAG=${{ github.sha }}  # Set image tag for deployment
+            
+            # SSH into Private EC2 from Bastion
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${{ secrets.PRIVATE_EC2_USER }}@${{ secrets.PRIVATE_EC2_HOST }} << 'EOF'
+            
+            # Navigate to the project directory on Private EC2
+            cd ~/Basic-Authentication-System
+            
+            # 1. Create the .env file using GitHub Secrets
+            cat <<EOT > .env
+            DB_USER=${{ secrets.DB_USER }}  # Must match GitHub Secrets
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}  # Must match GitHub Secrets
+            DB_HOST=${{ secrets.DB_HOST }}  # Must match GitHub Secrets
+            DB_NAME=${{ secrets.DB_NAME }}  # Must match GitHub Secrets
+            DB_PORT=${{ secrets.DB_PORT }}  # Must match GitHub Secrets
+            PORT=${{ secrets.APP_PORT }}  # Must match GitHub Secrets
+            JWT_SECRET=${{ secrets.JWT_SECRET }}  # Must match GitHub Secrets
+            EOT
+            
+            # 2. Log in to AWS ECR
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ECR_REGISTRY }}
+            
+            # 3. Pull the latest Docker image
+            docker pull ${{ secrets.AWS_ECR_REGISTRY }}/${{ secrets.AWS_ECR_REPOSITORY }}:${IMAGE_TAG}
+            
+            # 4. Restart the Docker service (Ensure Docker is installed beforehand)
+            sudo systemctl restart docker
+            
+            # 5. Stop and remove existing containers
+            docker compose down --remove-orphans
+            
+            # 6. Start new containers with the latest image
+            docker compose up -d --force-recreate
+            
+            # 7. Clean up unused Docker images to free space
+            docker image prune -af
+            EOF
+
+      # Public EC2 Deployment (Commented Out)
+      # - name: Deploy to EC2 (Public Server)
+      #   uses: appleboy/ssh-action@master
+      #   if: github.ref == 'refs/heads/develop'  # Ensures deployment only from the develop branch
+      #   with:
+      #     host: ${{ secrets.SSH_STAGING_HOST }}  # Must match GitHub Secrets
+      #     username: ${{ secrets.ALT_SSH_USER }}  # Must match GitHub Secrets
+      #     key: ${{ secrets.SSH_STAGING_SECRET }}  # Must match GitHub Secrets
+      #     script: |
+      #       set -ex
+      #       export IMAGE_TAG=${{ github.sha }}  # Set image tag for deployment
+      #       
+      #       # Navigate to the project directory on EC2
+      #       cd ~/Basic-Authentication-System
+      #       
+      #       # 1. Create the .env file using GitHub Secrets
+      #       cat <<EOF > .env
+      #       DB_USER=${{ secrets.DB_USER }}  # Must match GitHub Secrets
+      #       DB_PASSWORD=${{ secrets.DB_PASSWORD }}  # Must match GitHub Secrets
+      #       DB_HOST=${{ secrets.DB_HOST }}  # Must match GitHub Secrets
+      #       DB_NAME=${{ secrets.DB_NAME }}  # Must match GitHub Secrets
+      #       DB_PORT=${{ secrets.DB_PORT }}  # Must match GitHub Secrets
+      #       PORT=${{ secrets.APP_PORT }}  # Must match GitHub Secrets
+      #       JWT_SECRET=${{ secrets.JWT_SECRET }}  # Must match GitHub Secrets
+      #       EOF
+      #       
+      #       # 2. Log in to AWS ECR
+      #       aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ECR_REGISTRY }}
+      #       
+      #       # 3. Pull the latest Docker image
+      #       docker pull ${{ secrets.AWS_ECR_REGISTRY }}/${{ secrets.AWS_ECR_REPOSITORY }}:${IMAGE_TAG}
+      #       
+      #       # 4. Restart the Docker service (Ensure Docker is installed beforehand)
+      #       sudo systemctl restart docker
+      #       
+      #       # 5. Stop and remove existing containers
+      #       docker compose down --remove-orphans
+      #       
+      #       # 6. Start new containers with the latest image
+      #       docker compose up -d --force-recreate
+      #       
+      #       # 7. Clean up unused Docker images to free space
+      #       docker image prune -af
